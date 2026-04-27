@@ -8,13 +8,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from sklearn.base import clone
 from sklearn.cluster import KMeans, DBSCAN
 from sklearn.dummy import DummyClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
+    balanced_accuracy_score,
     classification_report,
     confusion_matrix,
     precision_recall_fscore_support,
@@ -27,6 +27,7 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.utils.class_weight import compute_class_weight
 
 
 # =========================
@@ -94,6 +95,7 @@ def load_data(file_list):
 def validate_columns(df):
     required_cols = BIOPHONY_COLS + ANTHROPHONY_COLS + GEOPHONY_COLS + feature_cols
     missing_cols = [col for col in required_cols if col not in df.columns]
+
     if missing_cols:
         raise ValueError(f"Missing required columns: {missing_cols}")
 
@@ -130,17 +132,19 @@ def prepare_dataset(df):
     X = df[feature_cols].values.astype(np.float32)
 
     print("Total samples:", len(df))
+
     print("\nLoaded files:")
     for f in df["source_file"].unique():
         print(" -", f)
 
-    print("\nClass distribution:")
+    print("\nOriginal class distribution:")
     unique, counts = np.unique(y, return_counts=True)
     for cls, cnt in zip(unique, counts):
         print(f"Class {cls} ({CLASS_NAMES[cls]}): {cnt}")
 
     print("\nNaN check before split:")
     print("Total NaN values in X:", np.isnan(X).sum())
+
     for i, col in enumerate(feature_cols):
         print(f"{col}: {np.isnan(X[:, i]).sum()}")
 
@@ -171,16 +175,49 @@ def prepare_dataset(df):
 
 
 # =========================
-# 6. DQN MODEL
+# 6. OVERSAMPLING
+# =========================
+def oversample_minority_classes(X_train, y_train):
+    unique_classes, counts = np.unique(y_train, return_counts=True)
+    max_count = counts.max()
+
+    X_balanced = []
+    y_balanced = []
+
+    for cls in unique_classes:
+        cls_indices = np.where(y_train == cls)[0]
+
+        sampled_indices = np.random.choice(
+            cls_indices,
+            size=max_count,
+            replace=True
+        )
+
+        X_balanced.append(X_train[sampled_indices])
+        y_balanced.append(y_train[sampled_indices])
+
+    X_balanced = np.vstack(X_balanced).astype(np.float32)
+    y_balanced = np.concatenate(y_balanced).astype(np.int64)
+
+    shuffle_idx = np.random.permutation(len(y_balanced))
+
+    return X_balanced[shuffle_idx], y_balanced[shuffle_idx]
+
+
+# =========================
+# 7. DQN MODEL
 # =========================
 class DQN(nn.Module):
     def __init__(self, input_dim=13, num_actions=4):
         super().__init__()
+
         self.net = nn.Sequential(
             nn.Linear(input_dim, 128),
             nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Linear(128, 64),
             nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Linear(64, num_actions)
         )
 
@@ -191,15 +228,18 @@ class DQN(nn.Module):
 class DQNTrainer:
     def __init__(self, input_dim, num_actions, device):
         self.device = device
+        self.num_actions = num_actions
+
         self.model = DQN(input_dim=input_dim, num_actions=num_actions).to(device)
         self.target_model = DQN(input_dim=input_dim, num_actions=num_actions).to(device)
+
         self.target_model.load_state_dict(self.model.state_dict())
         self.target_model.eval()
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.0005)
         self.criterion = nn.SmoothL1Loss()
 
-        self.memory = deque(maxlen=5000)
+        self.memory = deque(maxlen=10000)
         self.batch_size = 64
 
     def store_experience(self, state, action, reward, next_state, done):
@@ -241,9 +281,32 @@ class DQNTrainer:
 
         return loss.item()
 
-    def fit(self, X_train, y_train, episodes=20, gamma=0.9, epsilon=1.0,
-            epsilon_min=0.1, epsilon_decay=0.95, target_update_freq=2):
-        print("\n===== TRAINING DQN =====")
+    def fit(
+        self,
+        X_train,
+        y_train,
+        episodes=20,
+        gamma=0.9,
+        epsilon=1.0,
+        epsilon_min=0.1,
+        epsilon_decay=0.95,
+        target_update_freq=2
+    ):
+        print("\n===== TRAINING BALANCED DQN =====")
+
+        class_weights = compute_class_weight(
+            class_weight="balanced",
+            classes=np.unique(y_train),
+            y=y_train
+        )
+
+        reward_weights = {
+            cls: weight for cls, weight in zip(np.unique(y_train), class_weights)
+        }
+
+        print("\nDQN reward weights:")
+        for cls, weight in reward_weights.items():
+            print(f"Class {cls} ({CLASS_NAMES[cls]}): {weight:.4f}")
 
         for episode in range(episodes):
             total_reward = 0.0
@@ -256,23 +319,30 @@ class DQNTrainer:
 
             for i in range(len(X_train_ep)):
                 state = X_train_ep[i]
+                true_class = y_train_ep[i]
 
                 if random.random() < epsilon:
-                    action = random.randint(0, 3)
+                    action = random.randint(0, self.num_actions - 1)
                 else:
                     with torch.no_grad():
                         state_tensor = torch.tensor(
-                            state, dtype=torch.float32, device=self.device
+                            state,
+                            dtype=torch.float32,
+                            device=self.device
                         ).unsqueeze(0)
+
                         action = torch.argmax(self.model(state_tensor), dim=1).item()
 
-                reward = 1.0 if action == y_train_ep[i] else -1.0
+                if action == true_class:
+                    reward = float(reward_weights[true_class])
+                    correct_count += 1
+                else:
+                    reward = -0.5
+
                 total_reward += reward
 
-                if action == y_train_ep[i]:
-                    correct_count += 1
-
                 done = (i == len(X_train_ep) - 1)
+
                 if done:
                     next_state = np.zeros_like(state, dtype=np.float32)
                 else:
@@ -294,7 +364,7 @@ class DQNTrainer:
 
             print(
                 f"Episode {episode + 1:02d} | "
-                f"Reward: {total_reward:.1f} | "
+                f"Reward: {total_reward:.2f} | "
                 f"Train Acc: {train_acc:.4f} | "
                 f"Avg Loss: {avg_loss:.4f} | "
                 f"Epsilon: {epsilon:.2f}"
@@ -302,44 +372,70 @@ class DQNTrainer:
 
     def predict(self, X):
         self.model.eval()
+
         with torch.no_grad():
             states_tensor = torch.tensor(X, dtype=torch.float32, device=self.device)
             q_values = self.model(states_tensor)
             preds = torch.argmax(q_values, dim=1).cpu().numpy()
+
         return preds
 
 
 # =========================
-# 7. EVALUATION HELPERS
+# 8. EVALUATION HELPERS
 # =========================
 def evaluate_classifier(name, y_true, y_pred):
     acc = accuracy_score(y_true, y_pred)
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, average="weighted", zero_division=0
+    balanced_acc = balanced_accuracy_score(y_true, y_pred)
+
+    weighted_precision, weighted_recall, weighted_f1, _ = precision_recall_fscore_support(
+        y_true,
+        y_pred,
+        average="weighted",
+        zero_division=0
     )
+
+    macro_precision, macro_recall, macro_f1, _ = precision_recall_fscore_support(
+        y_true,
+        y_pred,
+        average="macro",
+        zero_division=0
+    )
+
     cm = confusion_matrix(y_true, y_pred)
 
     print(f"\n===== {name} TEST RESULTS =====")
-    print(f"Accuracy : {acc:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall   : {recall:.4f}")
-    print(f"F1-score : {f1:.4f}")
+    print(f"Accuracy           : {acc:.4f}")
+    print(f"Balanced Accuracy  : {balanced_acc:.4f}")
+    print(f"Weighted Precision : {weighted_precision:.4f}")
+    print(f"Weighted Recall    : {weighted_recall:.4f}")
+    print(f"Weighted F1-score  : {weighted_f1:.4f}")
+    print(f"Macro Precision    : {macro_precision:.4f}")
+    print(f"Macro Recall       : {macro_recall:.4f}")
+    print(f"Macro F1-score     : {macro_f1:.4f}")
+
     print("\nConfusion Matrix:")
     print(cm)
+
     print("\nClassification Report:")
     print(classification_report(y_true, y_pred, zero_division=0))
 
     return {
         "model": name,
         "accuracy": acc,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1
+        "balanced_accuracy": balanced_acc,
+        "weighted_precision": weighted_precision,
+        "weighted_recall": weighted_recall,
+        "weighted_f1": weighted_f1,
+        "macro_precision": macro_precision,
+        "macro_recall": macro_recall,
+        "macro_f1": macro_f1
     }
 
 
 def evaluate_clustering(name, y_true, cluster_labels):
-    valid_mask = cluster_labels != -1  # exclude DBSCAN noise
+    valid_mask = cluster_labels != -1
+
     if valid_mask.sum() == 0:
         ari = 0.0
         nmi = 0.0
@@ -357,9 +453,13 @@ def evaluate_clustering(name, y_true, cluster_labels):
     return {
         "model": name,
         "accuracy": np.nan,
-        "precision": np.nan,
-        "recall": np.nan,
-        "f1": np.nan,
+        "balanced_accuracy": np.nan,
+        "weighted_precision": np.nan,
+        "weighted_recall": np.nan,
+        "weighted_f1": np.nan,
+        "macro_precision": np.nan,
+        "macro_recall": np.nan,
+        "macro_f1": np.nan,
         "ari": ari,
         "nmi": nmi,
         "coverage": coverage
@@ -367,7 +467,7 @@ def evaluate_clustering(name, y_true, cluster_labels):
 
 
 # =========================
-# 8. CLASSICAL MODELS
+# 9. SUPERVISED MODELS
 # =========================
 def run_supervised_models(X_train, X_test, y_train, y_test):
     models = {
@@ -375,14 +475,16 @@ def run_supervised_models(X_train, X_test, y_train, y_test):
             hidden_layer_sizes=(128, 64),
             activation="relu",
             solver="adam",
-            max_iter=300,
+            max_iter=1000,
             random_state=SEED
         ),
+
         "RandomForest": RandomForestClassifier(
-            n_estimators=200,
+            n_estimators=300,
             random_state=SEED,
             class_weight="balanced_subsample"
         ),
+
         "SVM": SVC(
             kernel="rbf",
             C=1.0,
@@ -390,18 +492,22 @@ def run_supervised_models(X_train, X_test, y_train, y_test):
             class_weight="balanced",
             random_state=SEED
         ),
+
         "KNN": KNeighborsClassifier(
             n_neighbors=7
         ),
+
         "LogisticRegression": LogisticRegression(
-            max_iter=1000,
+            max_iter=2000,
             random_state=SEED,
             class_weight="balanced"
         ),
+
         "DummyMostFrequent": DummyClassifier(
             strategy="most_frequent",
             random_state=SEED
         ),
+
         "DummyStratified": DummyClassifier(
             strategy="stratified",
             random_state=SEED
@@ -411,6 +517,7 @@ def run_supervised_models(X_train, X_test, y_train, y_test):
     results = []
 
     for name, model in models.items():
+        print(f"\nTraining {name}...")
         model.fit(X_train, y_train)
         preds = model.predict(X_test)
         metrics_row = evaluate_classifier(name, y_test, preds)
@@ -420,7 +527,7 @@ def run_supervised_models(X_train, X_test, y_train, y_test):
 
 
 # =========================
-# 9. UNSUPERVISED MODELS
+# 10. UNSUPERVISED MODELS
 # =========================
 def run_clustering_models(X_train, X_test, y_test):
     results = []
@@ -438,44 +545,84 @@ def run_clustering_models(X_train, X_test, y_test):
 
 
 # =========================
-# 10. MAIN
+# 11. MAIN
 # =========================
 def main():
     df = load_data(files)
     validate_columns(df)
+
     X_train, X_test, y_train, y_test = prepare_dataset(df)
+
+    X_train_balanced, y_train_balanced = oversample_minority_classes(
+        X_train,
+        y_train
+    )
+
+    print("\nBalanced training distribution:")
+    unique, counts = np.unique(y_train_balanced, return_counts=True)
+
+    for cls, cnt in zip(unique, counts):
+        print(f"Class {cls} ({CLASS_NAMES[cls]}): {cnt}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("\nUsing device:", device)
 
     all_results = []
 
-    # ---- DQN ----
+    # =========================
+    # DQN
+    # =========================
     dqn_trainer = DQNTrainer(
         input_dim=len(feature_cols),
         num_actions=4,
         device=device
     )
-    dqn_trainer.fit(X_train, y_train)
+
+    dqn_trainer.fit(
+        X_train_balanced,
+        y_train_balanced,
+        episodes=20
+    )
+
     dqn_preds = dqn_trainer.predict(X_test)
-    dqn_result = evaluate_classifier("DQN", y_test, dqn_preds)
+    dqn_result = evaluate_classifier("Balanced DQN", y_test, dqn_preds)
     all_results.append(dqn_result)
 
-    # ---- Supervised models ----
-    supervised_results = run_supervised_models(X_train, X_test, y_train, y_test)
+    # =========================
+    # SUPERVISED MODELS
+    # =========================
+    supervised_results = run_supervised_models(
+        X_train_balanced,
+        X_test,
+        y_train_balanced,
+        y_test
+    )
+
     all_results.extend(supervised_results)
 
-    # ---- Unsupervised models ----
-    clustering_results = run_clustering_models(X_train, X_test, y_test)
+    # =========================
+    # UNSUPERVISED MODELS
+    # =========================
+    clustering_results = run_clustering_models(
+        X_train,
+        X_test,
+        y_test
+    )
+
     all_results.extend(clustering_results)
 
-    # ---- Final comparison table ----
+    # =========================
+    # FINAL COMPARISON
+    # =========================
     results_df = pd.DataFrame(all_results)
+
     print("\n===== FINAL MODEL COMPARISON =====")
     print(results_df)
 
-    results_df.to_csv("model_comparison_results.csv", index=False)
-    print("\nSaved results to: model_comparison_results.csv")
+    results_df.to_csv("balanced_model_comparison_results.csv", index=False)
+
+    print("\nSaved results to: balanced_model_comparison_results.csv")
 
 
-main()
+if __name__ == "__main__":
+    main()
